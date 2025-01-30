@@ -179,13 +179,14 @@ sudo apt-get install fonts-noto-cjk
 </p>
 
 
-
-
-
-
 ## Cases
 Please see cases/ file.
 There are only limited cases for now, including [reward hacking](https://github.com/ZihanWang314/agent-r1/blob/main/cases/reward_hacking.txt) and the [suck moment](https://github.com/ZihanWang314/agent-r1/blob/main/cases/suck_moment.txt). we will add more cases recently.
+
+## Feedback
+
+We welcome all sorts of feedback! Please just raise an issue, no matter if it's any bugs you find or specific questions / suggestions regarding the project, so our team members won't be answering similar problems multiple times and thus would lead to more productive and efficient community building. Cheers!
+
 
 
 ## Authors
