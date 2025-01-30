@@ -5,14 +5,11 @@ export NUM_BOXES=1
 export MAX_STEPS=5
 export SEARCH_DEPTH=30
 
-# export CUDA_VISIBLE_DEVICES=0
-# export BASE_MODEL=Qwen/Qwen2.5-0.5B
-# export EXPERIMENT_NAME=test-qwen2.5-0.5b
 
 export CUDA_VISIBLE_DEVICES=0
-export BASE_MODEL=checkpoints/Agent-R1/test-qwen2.5-0.5b-instruct-1mbsz/actor/global_step_100
-export EXPERIMENT_NAME=test-qwen2.5-0.5b-imagetest
-
+export BASE_MODEL=/map-vepfs/huggingface/models/Qwen2.5-0.5B-Instruct
+export EXPERIMENT_NAME=test-qwen2-vl-2b-imagetest
+export WANDB_API_KEY=$WANDB_API_KEY
 
 export MICRO_BATCH_SIZE=1
 export TRAIN_BATCH_SIZE=128 # 256
@@ -26,6 +23,7 @@ export LOG_MODE="['wandb']" # or 'console'
 export GCP=True # gradient checkpointing
 export N_GPUS=1
 export ROLLOUT_TP_SIZE=1
+export CONFIG_PATH=verl/trainer/config/ppo_trainer.yaml
 
 bash ./train.sh # more arguments in this file
 
