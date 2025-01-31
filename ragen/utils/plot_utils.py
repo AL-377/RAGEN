@@ -5,6 +5,7 @@ from collections import defaultdict
 import os
 import textwrap
 import re
+import numpy as np
 
 def save_trajectory_to_pdf(trajectory, save_dir):
     """
@@ -123,3 +124,38 @@ def parse_llm_output(llm_output: str, strategy: str):
         }
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
+
+def render_observation_to_image(observation):
+    # Convert the text-based observation into a 2D array
+    grid = [list(row.strip()) for row in observation.strip().split('\n')]
+    grid_array = np.array(grid)
+
+    # Create a figure and axis
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_axis_off()
+
+    # Create a color map for the grid
+    cmap = {
+        '#': 'black',
+        'O': 'red',
+        '_': 'white',
+        'X': 'blue',
+        'P': 'green'
+    }
+
+    # Render each cell in the grid
+    for (i, j), val in np.ndenumerate(grid_array):
+        ax.text(j, i, val, ha='center', va='center', color=cmap.get(val, 'black'))
+        ax.add_patch(plt.Rectangle((j-0.5, i-0.5), 1, 1, fill=True, color=cmap.get(val, 'white')))
+
+    # Adjust the limits and aspect
+    ax.set_xlim(-0.5, grid_array.shape[1] - 0.5)
+    ax.set_ylim(grid_array.shape[0] - 0.5, -0.5)
+    ax.set_aspect('equal')
+
+    # Convert the plot to an image
+    fig.canvas.draw()
+    image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close(fig)
+    return image

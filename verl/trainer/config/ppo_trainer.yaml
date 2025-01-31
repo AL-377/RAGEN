@@ -137,6 +137,10 @@ reward_model:
   ulysses_sequence_parallel_size: 1 # sp size
   use_dynamic_bsz: ${critic.use_dynamic_bsz}
   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+  length_reward:
+    enable: True
+    min_length: 10  # 最小有效长度
+    max_length: 200 # 最大有效长度
 
 algorithm:
   gamma: 1.0

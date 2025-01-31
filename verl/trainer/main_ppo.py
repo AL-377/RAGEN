@@ -65,9 +65,27 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine) -> None:
+    def __init__(self, tokenizer, config, num_examine=3) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
+        self.max_thought_length = 0
+        self.config = config  # 添加配置参数
+
+    def _compute_length_reward(self, response_length: int) -> float:
+        """计算长度reward
+        Args:
+            response_length: 当前response的长度
+            base_reward: 基础游戏reward
+        Returns:
+            float: 长度reward
+        """
+        # 更新最长长度记录
+        self.max_thought_length = max(self.max_thought_length, response_length)
+        
+        # 计算长度比例
+        length_ratio = response_length / max(self.max_thought_length, 1)
+        
+        return length_ratio
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -107,7 +125,21 @@ class RewardManager():
             compute_score_fn = _select_rm_score_fn(data_source)
 
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
-            reward_tensor[i, valid_response_length - 1] = score
+
+            # TODO
+            # 计算长度reward
+            if self.config.reward_model.length_reward.enable:
+                length_reward = self._compute_length_reward(valid_response_length)
+            else:
+                length_reward = 1.0
+            
+            # 组合rewards
+            final_reward = score * length_reward
+            
+            # 设置reward
+            reward_tensor[i, valid_response_length - 1] = final_reward
+
+
             all_scores.append(score)
 
             if data_source not in already_print_data_sources:
@@ -210,10 +242,10 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    reward_fn = RewardManager(tokenizer=tokenizer, config=config, num_examine=0)
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, config=config, num_examine=1)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
