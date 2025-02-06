@@ -23,7 +23,10 @@ class SokobanEnv(gym_sokoban.envs.sokoban_env.SokobanEnv):
         # after max_steps, game is over
         # search depth is the upper bound of the search strategy from dfs
         # search depth should be smaller than max steps to ensure the game can be finished
-    
+
+        # total reward on trajectory
+        self.reward = 0
+
     @staticmethod
     def parse_update_info_to_obs(update_info, action_is_valid):
         observation, reward, done, _ = update_info
@@ -35,7 +38,12 @@ class SokobanEnv(gym_sokoban.envs.sokoban_env.SokobanEnv):
 
     @classmethod
     def execute_predictions(cls, envs, predictions, pad_token):
-        # print length of envs, predictions
+        """
+        print length of envs, predictions
+        reward is calculated based on:
+            - game reward (penalty for one step, reward for success)
+            - penalty for invalid action
+        """
         cur_actions, action_is_valid = cls.postprocess_predictions(predictions)
         next_obs = []
         for env, action, response, av in zip(envs, cur_actions, predictions, action_is_valid):
@@ -50,7 +58,9 @@ class SokobanEnv(gym_sokoban.envs.sokoban_env.SokobanEnv):
             if env.success():
                 obs += pad_token
             else:
-                env_feedback = cls.parse_update_info_to_obs(env.step(action), av)
+                observation, reward, done, extra_info = env.step(action)
+                env_feedback = cls.parse_update_info_to_obs((observation, reward, done, extra_info), av)
+                env.reward += reward if av else (reward - 0.1)
                 obs += "\n <|im_start|>user\n" + env_feedback + "<|im_end|>\n" + "<|im_start|>assistant\n<think>"
             next_obs.append(obs)
         return next_obs
@@ -109,6 +119,7 @@ class SokobanEnv(gym_sokoban.envs.sokoban_env.SokobanEnv):
         return list(range(self.action_space.start, self.action_space.start + self.action_space.n))
 
     def reset(self, mode='tiny_rgb_array', seed=None):
+        self.reward = 0
         with NoLoggerWarnings():
             try:
                 with set_seed(seed):
@@ -189,6 +200,7 @@ class SokobanEnv(gym_sokoban.envs.sokoban_env.SokobanEnv):
         new_self.box_mapping = self.box_mapping.copy()
         new_self.action_sequence = self.action_sequence.copy()
         new_self.player_position = self.player_position.copy()
+        new_self.reward = self.reward
         return new_self
 
 GRID_LOOKUP = {

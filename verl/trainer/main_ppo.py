@@ -106,7 +106,21 @@ class RewardManager():
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
-            score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
+            if data_source == 'sokoban':
+                if 'reward' not in data_item.non_tensor_batch.keys():
+                    # TODO: currently validate is not implemented
+                    score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
+                    print("[WARNING] reward is not in data_item.non_tensor_batch.keys(), probably because validate is not implemented")
+                else:
+                    score = data_item.non_tensor_batch['reward']
+                score = float(score)
+                print(f"reward: {score}")
+                if score > 15:
+                    print(f"[REWARD TOO MUCH]. solution: \n{sequences_str}")
+                # score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
+            else:
+                score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
+
             reward_tensor[i, valid_response_length - 1] = score
             all_scores.append(score)
 

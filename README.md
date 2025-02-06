@@ -130,7 +130,7 @@ export SEARCH_DEPTH=30
 # export BASE_MODEL=Qwen/Qwen2.5-0.5B
 # export EXPERIMENT_NAME=test-qwen2.5-0.5b
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0 # For multi-gpus, please make sure MICRO_BATCH_SIZE >= gpu_count
 export BASE_MODEL=checkpoints/Agent-R1/test-qwen2.5-0.5b-instruct-1mbsz/actor/global_step_100
 export EXPERIMENT_NAME=test-qwen2.5-0.5b-imagetest
 

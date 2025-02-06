@@ -707,19 +707,19 @@ class RayPPOTrainer(object):
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(rollings)
                             meta_info.update(gen_batch_output.meta_info)
 
-                        # process gen_batch_output, remove all things like reward: xxx \n to forbid reward hacking
-                        # decode responses, remove all things like reward: xxx \n to forbid reward hacking
-                        cur_responses_decoded = self.tokenizer.batch_decode(gen_batch_output.batch['responses'], skip_special_tokens=False)
-                        # ifthere has been hacks, output this to a log 
-                        hack_pattern = r'reward: \d+\.\d+\n|done: (True|False)\n'
-                        hacked_responses = [response for response in cur_responses_decoded if re.search(hack_pattern, response)]
-                        if len(hacked_responses) > 0:
-                            print(f"[WARNING] HACKED RESPONSES: {hacked_responses}")
-                            cur_responses_decoded = [re.sub(hack_pattern, '', response) for response in cur_responses_decoded]
-                            # see if there is any hack left
-                            if len(hacked_responses) == 0:
-                                print(f"[DEBUG] No hack left in responses.")
-                            gen_batch_output.batch['responses'] = self._batch_tokenize(cur_responses_decoded)
+                        # # process gen_batch_output, remove all things like reward: xxx \n to forbid reward hacking
+                        # # decode responses, remove all things like reward: xxx \n to forbid reward hacking
+                        # cur_responses_decoded = self.tokenizer.batch_decode(gen_batch_output.batch['responses'], skip_special_tokens=False)
+                        # # ifthere has been hacks, output this to a log 
+                        # hack_pattern = r'reward: \d+\.\d+\n|done: (True|False)\n'
+                        # hacked_responses = [response for response in cur_responses_decoded if re.search(hack_pattern, response)]
+                        # if len(hacked_responses) > 0:
+                        #     print(f"[WARNING] HACKED RESPONSES: {hacked_responses}")
+                        #     cur_responses_decoded = [re.sub(hack_pattern, '', response) for response in cur_responses_decoded]
+                        #     # see if there is any hack left
+                        #     if len(hacked_responses) == 0:
+                        #         print(f"[DEBUG] No hack left in responses.")
+                        #     gen_batch_output.batch['responses'] = self._batch_tokenize(cur_responses_decoded)
 
                         os.makedirs(f'.log/{self.config.trainer.experiment_name}/rollout_step_{rollout_step}', exist_ok=True)
                         import datetime
@@ -728,7 +728,7 @@ class RayPPOTrainer(object):
                             f.write(f"{now}\n")
                             f.write(f"[left side]: \n{rollings}\n")
                             f.write(f"[left side shape]: \n{rollings.batch['input_ids'].shape}\n")
-                            for idx in range(4):
+                            for idx in range(self.config.logging.log_n_sample_per_batch):
                                 f.write(f"[left side decoded]: \n{self.tokenizer.decode(rollings.batch['input_ids'][idx], skip_special_tokens=False)}\n")
                             f.write(f"\n")
 
@@ -736,7 +736,7 @@ class RayPPOTrainer(object):
                             f.write(f"{now}\n")
                             f.write(f"[right side]: \n{gen_batch_output}\n")
                             f.write(f"[right side shape]: \n{gen_batch_output.batch['responses'].shape}\n")
-                            for idx in range(4):
+                            for idx in range(self.config.logging.log_n_sample_per_batch):
                                 f.write(f"[right side decoded]: \n{self.tokenizer.decode(gen_batch_output.batch['responses'][idx], skip_special_tokens=False)}\n")
                             f.write(f"\n")
 
@@ -814,6 +814,12 @@ class RayPPOTrainer(object):
                         max_len = min(max_prompt_len, effective_len)
                         original_right_side['responses'] = original_right_side['responses'][:, :max_len]
 
+                    # add reward to DataProto batch.non_tensor_batch['reward']
+                    batch.non_tensor_batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
+                    for idx, env in enumerate(envs):
+                        batch.non_tensor_batch['reward'][idx] = env.reward
+
+                    # save trajectory as images
                     if trajectory is not None:
                         save_trajectory_step_size = self.config.logging.log_image_step_size
                         if not self.global_steps % save_trajectory_step_size:
