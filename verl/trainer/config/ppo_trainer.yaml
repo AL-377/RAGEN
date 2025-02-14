@@ -85,6 +85,7 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    n_agent: 1 # different here used for agent tasks only
 
 critic:
   strategy: fsdp
@@ -142,6 +143,7 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  no_think_rl: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
@@ -166,15 +168,10 @@ max_turns: 10
 
 env:
   name: sokoban
-  dim_x: 6
-  dim_y: 6
-  num_boxes: 2
-  max_steps: 10
-  search_depth: 10
 
 logging:
   log_images: True
-  log_image_dir: .log.debug/trajectory
+  log_image_dir: log/trajectory
   log_image_step_size: 1
   log_n_image_per_batch: 4
   log_n_sample_per_batch: 1

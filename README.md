@@ -70,98 +70,149 @@ We prepare to release a complete wandb plot for these experiment runs, although 
 
 
 ## Environment Setup
-
+To setup environment and download data (7MB), you can run:
 ```bash
-conda create -n ragen python=3.9 -y
-conda activate ragen
+bash scripts/setup_ragen.sh
 
-git clone git@github.com:ZihanWang314/ragen.git
-cd ragen
-
-# setup install
-pip install -e . # includes verl-ragen (by us) and verl-core (by the verl team)
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-
-
-# Optional: to install flash-attn, you may need to install cuda-toolkit first if you don't have
-conda install -c "nvidia/label/cuda-12.1.0" cuda-toolkit -y
-export CUDA_HOME=$CONDA_PREFIX # /opt/conda/envs/zero
-pip3 install flash-attn --no-build-isolation
-
-
-pip install -r requirements.txt # other packages
+python scripts/download_data.py
 ```
+if it fails, you can try to run the lines in `scripts/setup_ragen.md` manually.
 
 
 ## Train Models
 
 ### Create data
 
-On the [Gym-Sokoban](https://github.com/mpSchrader/gym-sokoban) task, We create 10k first-round-observation data for training and run for <=1 epoch. 
+On the [Gym-Sokoban](https://github.com/mpSchrader/gym-sokoban) and [FrozenLake](https://gymnasium.farama.org/environments/toy_text/frozen_lake/) tasks, We create 10k first-round-observation data for training, respectively.
+
+<details>
+<summary>Click here to see how to synthesize data manually.</summary>
+
+You can choose to generate basic data or holisitic data for research purpose.
 ```bash
-# sokoban env settings. will determine game difficulty
-# it's normal to see some SOKOBAN errors, but the data will be created and it's fine
+# basic data creation
+bash scripts/create_data.sh
 
-export DIM_X=6
-export DIM_Y=6
-export NUM_BOXES=1
-export MAX_STEPS=5
-export SEARCH_DEPTH=30
-
-
-python scripts/dataset_curation.py \
-    --output data/sokoban \
-    --seed 10000 \
-    --train_size 10000 \
-    --test_size 10 \
-    --prefix qwen-instruct # we find it could work for base models
+# holisitic data creation for research purpose
+bash scripts/create_data_full.sh
 ```
+
+If you want to upload data to huggingface:
+```python
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo(repo_id='ZihanWang314/ragen-datasets', repo_type='dataset')
+api.upload_folder(
+    folder_path='data/',
+    repo_id='ZihanWang314/ragen-datasets',
+    repo_type='dataset'
+)
+```
+</details>
+
+<details>
+<summary>Click here to see data summarization.</summary>
+
+#### Sokoban Dataset Variants
+
+The following table shows the different configurations available for the Sokoban environment:
+
+| Dataset Name | Grid Size (DIM_X × DIM_Y) | Number of Boxes | Search Depth | Description |
+|-------------|--------------------------|----------------|--------------|-------------|
+| sokoban     | 6 × 6                   | 1              | 30           | Standard settings |
+| sokoban_hard| 6 × 6                   | 1              | 100          | Harder puzzles |
+| sokoban_xhard| 6 × 6                  | 1              | 500          | Very challenging puzzles |
+| sokoban_large| 8 × 8                  | 1              | 30           | Increased spatial complexity |
+| sokoban_xlarge| 10 × 10               | 1              | 30           | Very challenging spatial complexity |
+| sokoban_multi| 6 × 6                  | 2              | 30           | Strategic complexity |
+
+Common settings across all Sokoban variants:
+- MAX_STEPS: 10
+- Train size: 10,000 examples
+- Test size: 10 examples
+- Seed: 10000
+
+#### FrozenLake Dataset
+
+FrozenLake environment maintains a single configuration:
+- Grid Size: 6 × 6
+- Frozen tile percentage (P): 0.8
+- Train size: 10,000 examples
+- Test size: 10 examples
+- Seed: 100000
+
+</details>
+
+
 
 ### Export variables and train
+We provide a default config file in `verl/trainer/config/ppo_trainer.yaml`. You can change the parameters in the file. Below scripts would train two Agents on these two tasks, respectively. 
+
+NOTE: All possible arguments are in config/base.yaml and other yaml files.
+
 ```bash
-export DATA_DIR=data/sokoban
-export DIM_X=6
-export DIM_Y=6
-export NUM_BOXES=1
-export MAX_STEPS=5
-export SEARCH_DEPTH=30
+bash train.sh sokoban \
+    model.experiment_name=new_test
 
-# export CUDA_VISIBLE_DEVICES=0
-# export BASE_MODEL=Qwen/Qwen2.5-0.5B
-# export EXPERIMENT_NAME=test-qwen2.5-0.5b
+# override config
+bash train.sh sokoban \
+    model.experiment_name=new_test_debug \
+    training.train_batch_size=128 \
+    training.ppo_batch_size=64
 
-export CUDA_VISIBLE_DEVICES=0 # For multi-gpus, please make sure MICRO_BATCH_SIZE >= gpu_count
-export BASE_MODEL=checkpoints/Agent-R1/test-qwen2.5-0.5b-instruct-1mbsz/actor/global_step_100
-export EXPERIMENT_NAME=test-qwen2.5-0.5b-imagetest
-
-
-export MICRO_BATCH_SIZE=1
-export TRAIN_BATCH_SIZE=128 # 256
-export PPO_BATCH_SIZE=64 # 128
-export MAX_START_LENGTH=400 # the first round prompt max length
-export MAX_RESPONSE_LENGTH=100
-export MAX_OBS_LENGTH=120
-export MAX_TURNS=5
-export NUM_UPDATE_PER_ROLL=1 # roll out for a batch, then the model do N times of update. Currently not implemented.
-export LOG_MODE="['wandb']" # or 'console'
-export GCP=True # gradient checkpointing
-export N_GPUS=1
-export ROLLOUT_TP_SIZE=1
-
-bash ./train.sh # more arguments in this file
-
-# default config file is verl/trainer/config/ppo_trainer.yaml
+# For developers, if you want to add your own config keys, please check [ base.yaml | train.sh | ragen/train.py | verl/trainer/config/ppo_trainer.yaml | and the main_ppo.py in verl/trainer/ppo ] to make sure the changes are reflected coherently.
 
 ```
+
+## Supervised Finetuning (Optional)
+NOTE: Only tested with 1 GPU
+1. Create supervised finetuning data, and parquet files will be saved in `sft/data/<env_type>/`
+  - BFS is used to generate shortest action path for a given sokoban environment
+  - The data then fomulated as chat dataset.
+```bash
+bash sft/generate_data.sh <env_type>
+```
+
+2. Finetune the model (with LoRA)
+  - setting arguments in `sft/finetune_lora.sh`
+  - By setting `model.lora_rank=0`, we can turn off lora finetuning
+
+```bash
+bash sft/finetune_lora.sh <env_type> <num_gpus> <save_path>
+```
+
+3. Merge the LoRA weights with the base model
+  - Currently verl main_ppo.py seems not support loading LoRA weights, so we need to merge them with the base model.
+```bash
+python sft/utils/merge_lora.py \
+    --base_model_name <base_model_name> \
+    --lora_model_path <lora_model_path> \
+    --output_path <output_path>
+```
+
+4. Use SFT model for RL training
+  - By setting `BASE_MODEL` to the merged model path, we can use the SFT model for RL training.
+
+
+## All Experiments
+
+
 
 
 ## Visualization
 1. By setting arguments in `train.sh`, you can visualize the trajectory:
 ```bash
 logging.log_images=True # set to True to log images
-logging.log_image_dir=.log.debug/trajectory # set to the directory to save images
+logging.log_image_dir=log/trajectory # set to the directory to save images
 logging.log_image_step_size=1 # save image every _ steps
-logging.log_n_image_per_batch=8 # save _ images per batch   
+logging.log_n_image_per_batch=8 # save _ images per batch
+```
+
+You may use this command to visualize the trajectory:
+```bash
+cd log/trajectory
+python -m http.server 8000
+# check http://localhost:8000/[EXP_NAME]/step_[STEP_NUM]/trajectory_data_[ID].html
 ```
 
 2. You may also need to install fonts to make the figures displayed correctly:

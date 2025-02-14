@@ -18,8 +18,9 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
-data/sokoban/*
-data/spatial/*
+data
+sft/output/*
+sft/data/*
 
 # Distribution / packaging
 .Python
@@ -116,4 +117,6 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 # vim
 *.swp
 
-.log.debug
+log*
+
+**logs

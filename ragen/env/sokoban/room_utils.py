@@ -1,8 +1,160 @@
 import random
 import numpy as np
 import marshal
+import copy
+from collections import deque
 
-"""code is adapted from the nicely written gym_sokoban repo"""
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+def get_shortest_action_path(room_fixed, room_state, MAX_DEPTH=100):
+        """
+        Get the shortest action path to push all boxes to the target spots.
+        Use BFS to find the shortest path.
+        NOTE currently only support one player, only one shortest solution
+        =========================================================
+        Parameters:
+            room_state (np.ndarray): the state of the room
+                - 0: wall
+                - 1: empty space
+                - 2: box target
+                - 3: box on target
+                - 4: box not on target
+                - 5: player
+            room_fixed (np.ndarray): the fixed part of the room
+                - 0: wall
+                - 1: empty space
+                - 2: box target
+            MAX_DEPTH (int): the maximum depth of the search
+        =========================================================
+        Returns:
+            action_sequence (list): the action sequence to push all boxes to the target spots
+        """
+        
+        # BFS queue stores (room_state, path)
+        queue = deque([(copy.deepcopy(room_state), [])])
+        explored_states = set()
+        
+        # Possible moves: up, down, left, right
+        moves = [(-1,0), (1,0), (0,-1), (0,1)]
+        actions = [1, 2, 3, 4] # Corresponding action numbers
+        
+        while queue:
+            room_state, path = queue.popleft()
+            if len(path) > MAX_DEPTH:
+                return [] # No solution found
+
+            # reduce the search space by checking if the state has been explored
+            state_tohash = marshal.dumps(room_state)
+            if state_tohash in explored_states:
+                continue
+            explored_states.add(state_tohash)
+            
+
+            # get information of the room
+            player_pos = tuple(np.argwhere(room_state == 5)[0])
+            boxes_on_target = set(map(tuple, np.argwhere((room_state == 3))))
+            boxes_not_on_target = set(map(tuple, np.argwhere((room_state == 4))))
+            boxes = boxes_on_target | boxes_not_on_target
+
+
+            # Check if all boxes are on targets
+            if not boxes_not_on_target:
+                return path
+                
+            # Try each direction
+            for move, action in zip(moves, actions):
+                new_room_state = copy.deepcopy(room_state)
+                new_player_pos = (player_pos[0] + move[0], player_pos[1] + move[1])
+                
+                # Check is new player position is wall or out of bound
+                if new_player_pos[0] < 0 or new_player_pos[0] >= room_fixed.shape[0] \
+                    or new_player_pos[1] < 0 or new_player_pos[1] >= room_fixed.shape[1] \
+                    or room_fixed[new_player_pos] == 0:
+                    continue
+                    
+                # If there's a box, check if we can push it
+                if new_player_pos in boxes:
+                    box_pos = new_player_pos # the original box position
+                    new_box_pos = (new_player_pos[0] + move[0], new_player_pos[1] + move[1])
+                    
+                    # Can't push if hitting wall or another box or out of bound
+                    if room_fixed[new_box_pos] == 0 or new_box_pos in boxes \
+                        or new_box_pos[0] < 0 or new_box_pos[0] >= room_fixed.shape[0] \
+                        or new_box_pos[1] < 0 or new_box_pos[1] >= room_fixed.shape[1]:
+                        continue
+                        
+                    # move the box
+                    
+                    new_room_state[box_pos] = room_fixed[box_pos]
+                    if room_fixed[new_box_pos] == 2:
+                        new_room_state[new_box_pos] = 3
+                    else:
+                        new_room_state[new_box_pos] = 4
+                
+                # player moves
+                new_room_state[player_pos] = room_fixed[player_pos]
+                new_room_state[new_player_pos] = 5
+                queue.append((new_room_state, path + [action]))
+                        
+        return [] # No solution found
+
+# def plot_animation(imgs):
+#     fig, ax = plt.subplots()
+#     im = ax.imshow(imgs[0])
+#     def init():
+#         im.set_data(imgs[0])
+#         return [im]
+#     def update(i):
+#         im.set_data(imgs[i])
+#         return [im]
+#     ani = animation.FuncAnimation(fig, update, frames=len(imgs), init_func=init, blit=True)
+#     return ani
+
+def plot_animation(imgs):
+    height, width = imgs[0].shape[:2]
+    fig = plt.figure(figsize=(width/100, height/100), dpi=500)
+    
+    ax = fig.add_axes([0, 0, 1, 1])
+    
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_frame_on(False)
+    
+    im = ax.imshow(imgs[0])
+    def init():
+        im.set_data(imgs[0])
+        return [im]
+    def update(i):
+        im.set_data(imgs[i])
+        return [im]
+    ani = animation.FuncAnimation(fig, update, frames=len(imgs), init_func=init, blit=True)
+    return ani
+
+def solve_sokoban(env, saved_animation_path):
+    """
+    Solve the given sokoban environment and save the animation
+    """
+    actions = get_shortest_action_path(env.room_fixed, env.room_state)
+    print(f"Found {len(actions)} actions: {actions}")
+    imgs = []
+    img_before_action = env.render('rgb_array')
+    imgs.append(img_before_action)
+    for action in actions:
+        env.step(action)
+        img_after_action = env.render('rgb_array')
+        imgs.append(img_after_action)
+    ani = plot_animation(imgs)
+    ani.save(saved_animation_path)
+
+
+
+        
+
+
+"""
+Following code is adapted from the nicely written gym_sokoban repo
+"""
 
 
 def generate_room(dim=(13, 13), p_change_directions=0.35, num_steps=25, num_boxes=3, tries=4, second_player=False, search_depth=100):

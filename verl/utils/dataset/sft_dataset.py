@@ -30,6 +30,8 @@ from verl.utils.fs import copy_local_path_from_hdfs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
 
+from ragen.utils import apply_chat_template
+import numpy as np
 
 class SFTDataset(Dataset):
     """
@@ -56,8 +58,15 @@ class SFTDataset(Dataset):
             tokenizer = hf_tokenizer(tokenizer)
         self.tokenizer: PreTrainedTokenizer = tokenizer
 
-        self.prompt_key = prompt_key if isinstance(prompt_key, (tuple, list)) else [prompt_key]
-        self.response_key = response_key if isinstance(response_key, (tuple, list)) else [response_key]
+        ########################## Original Codes ########################## 
+        # self.prompt_key = prompt_key if isinstance(prompt_key, (tuple, list)) else [prompt_key]
+        # self.response_key = response_key if isinstance(response_key, (tuple, list)) else [response_key]
+        ########################## Original Codes ##########################
+        assert isinstance(prompt_key, str)
+        assert isinstance(response_key, str)
+        self.prompt_key = prompt_key
+        self.response_key = response_key
+
         self.prompt_dict_keys = [] if not prompt_dict_keys else prompt_dict_keys
         self.response_dict_keys = [] if not response_dict_keys else response_dict_keys
 
@@ -113,12 +122,16 @@ class SFTDataset(Dataset):
         prompt = self.prompts[item]
         response = self.responses[item]
 
-        # apply chat template
-        prompt_chat = [{'role': 'user', 'content': prompt}]
+        ########################## Original Codes ##########################
+        # # apply chat template
+        # prompt_chat = [{'role': 'user', 'content': prompt}]
 
-        # string
-        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
-        response_chat_str = response + tokenizer.eos_token
+        # # string
+        # prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        # response_chat_str = response + tokenizer.eos_token
+        ########################## Original Codes ##########################
+        prompt_chat_str, response_chat_str = apply_chat_template(tokenizer, prompt, response, with_thinking=True, add_generation_prompt=True, tokenize=False)
+        response_chat_str = response_chat_str + tokenizer.eos_token
 
         # tokenize
         prompt_ids_output = tokenizer(prompt_chat_str, return_tensors='pt', add_special_tokens=False)

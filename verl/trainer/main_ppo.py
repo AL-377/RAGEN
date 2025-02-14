@@ -19,18 +19,21 @@ from verl import DataProto
 import torch
 import verl.utils.reward_score.countdown as countdown
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from ragen.env.sokoban import SokobanEnv
+from ragen.env import SokobanEnv, FrozenLakeEnv, BanditEnv, TwoArmedBanditEnv
 import re
 import numpy as np
 
 ENV_CLASS_MAPPING = {
-    'sokoban': SokobanEnv
+    'sokoban': SokobanEnv,
+    'frozenlake': FrozenLakeEnv,
+    'bandit': BanditEnv,
+    'two_armed_bandit': TwoArmedBanditEnv
 }
 
 def _select_rm_score_fn(data_source):
     if "countdown" in data_source:
         return countdown.compute_score
-    elif "sokoban" in data_source:
+    elif "sokoban" in data_source or "frozenlake" in data_source or "bandit" in data_source:
         def judge_fn(*args, **kwargs):
             solution = kwargs['solution_str']
             # 1. reward based on the game:
@@ -39,11 +42,11 @@ def _select_rm_score_fn(data_source):
             pattern = r'reward: (-?\d+\.\d+)\ndone: (True|False)'
             matches = re.findall(pattern, solution)
             reward = sum(float(match[0]) for match in matches)
-            print(f"reward: {reward}")
+            # print(f"reward: {reward}")
             # 2. format reward, find "action is invalid", add -0.1 to reward
             pattern = r'Action is invalid. You stay in the same position.'
             matches = re.findall(pattern, solution)
-            reward -= len(matches) * 0.1
+            reward -= len(matches) * 1
             if reward > 15:
                 print(f"[REWARD TOO MUCH]. solution: \n{solution}")
             return reward
@@ -106,16 +109,16 @@ class RewardManager():
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
-            if data_source == 'sokoban':
+            if data_source in ENV_CLASS_MAPPING.keys():
                 if 'reward' not in data_item.non_tensor_batch.keys():
                     # TODO: currently validate is not implemented
                     score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
-                    print("[WARNING] reward is not in data_item.non_tensor_batch.keys(), probably because validate is not implemented")
+                    # print("[WARNING] reward is not in data_item.non_tensor_batch.keys(), probably because validate is not implemented")
                 else:
                     score = data_item.non_tensor_batch['reward']
                 score = float(score)
-                print(f"reward: {score}")
-                if score > 15:
+                # print(f"reward: {score}")
+                if score > 20:
                     print(f"[REWARD TOO MUCH]. solution: \n{sequences_str}")
                 # score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth)
             else:
@@ -231,6 +234,14 @@ def main_task(config):
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
+    if config.env.name == 'frozenlake':
+        env = env_class(size=config.env.size, p=config.env.p)
+    elif config.env.name == 'bandit':
+        env = env_class(n_arms=config.env.n_arms)
+    elif config.env.name == 'two_armed_bandit':
+        env = env_class(low_risk_name=config.env.low_risk_name, high_risk_name=config.env.high_risk_name)
+    elif config.env.name == 'sokoban':
+        env = env_class(dim_room=(config.env.dim_x, config.env.dim_y), num_boxes=config.env.num_boxes, max_steps=config.env.max_steps, search_depth=config.env.search_depth)
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
                             role_worker_mapping=role_worker_mapping,
@@ -238,7 +249,7 @@ def main_task(config):
                             ray_worker_group_cls=ray_worker_group_cls,
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
-                            env=env_class(dim_room=(config.env.dim_x, config.env.dim_y), num_boxes=config.env.num_boxes, max_steps=config.env.max_steps, search_depth=config.env.search_depth),
+                            env=env,
                             env_class=env_class)
     trainer.init_workers()
     trainer.fit()

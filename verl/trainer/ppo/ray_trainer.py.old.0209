@@ -25,7 +25,6 @@ from pprint import pprint
 from typing import Type, Dict
 
 import re
-import json
 from collections import defaultdict
 
 import numpy as np
@@ -41,7 +40,14 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 
 import re
-from ragen.llm_agent.generation import LLMGenerationManager, GenerationConfig
+import ragen
+from ragen.utils import set_seed
+from ragen.utils.plot_utils import (
+    save_trajectory_to_output,
+    parse_llm_output
+)
+
+import shutil
 
 WorkerType = Type[Worker]
 
@@ -138,7 +144,7 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                       lam=lam)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
-    elif adv_estimator in ['grpo', 'brpo', 'apo']:
+    elif adv_estimator == 'grpo':
         token_level_rewards = data.batch['token_level_rewards']
         index = data.non_tensor_batch['uid']
         responses = data.batch['responses']
@@ -262,17 +268,6 @@ def compute_data_metrics(batch, use_critic=True):
         'prompt_length/clip_ratio':
             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
-
-    # metric for two-armed bandit
-    if batch.non_tensor_batch['data_source'][0] == 'two_armed_bandit':
-        batch_action = torch.from_numpy(np.array(batch.non_tensor_batch['bandit_metrics'], dtype=np.int16))
-        n_low_arm = torch.sum(batch_action == 1).detach().item()
-        n_high_arm = torch.sum(batch_action == 2).detach().item()
-        n_invalid = torch.sum(batch_action == 0).detach().item()
-        metrics['metric/n_low_arm'] = n_low_arm
-        metrics['metric/n_high_arm'] = n_high_arm
-        metrics['metric/n_invalid'] = n_invalid
-
     return metrics
 
 
@@ -346,8 +341,6 @@ class RayPPOTrainer(object):
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
 
-        self.val_num = 0
-
         # define KL control
         if self.use_reference_policy:
             if config.algorithm.kl_ctrl.type == 'fixed':
@@ -363,14 +356,6 @@ class RayPPOTrainer(object):
             self.kl_ctrl = core_algos.FixedKLController(kl_coef=0.)
 
         self._create_dataloader()
-        self._init_logger()
-    
-    def _init_logger(self):
-        from verl.utils.tracking import Tracking
-        self.logger = Tracking(project_name=self.config.trainer.project_name,
-                          experiment_name=self.config.trainer.experiment_name,
-                          default_backend=self.config.trainer.logger,
-                          config=OmegaConf.to_container(self.config, resolve=True))
 
     def _create_dataloader(self):
         from torch.utils.data import DataLoader
@@ -397,16 +382,16 @@ class RayPPOTrainer(object):
                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
                                        truncation='error')
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=self.config.data.val_batch_size,
+                                         batch_size=len(self.val_dataset),
                                          shuffle=True,
                                          drop_last=True,
                                          collate_fn=collate_fn)
 
-        print(f'Size of train dataloader: {len(self.train_dataloader)}')
-        print(f'Size of val dataloader: {len(self.val_dataloader)}')
-        
         assert len(self.train_dataloader) >= 1
         assert len(self.val_dataloader) >= 1
+
+        print(f'Size of train dataloader: {len(self.train_dataloader)}')
+        print(f'Size of val dataloader: {len(self.val_dataloader)}')
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -421,6 +406,58 @@ class RayPPOTrainer(object):
         with open_dict(self.config):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
+
+    def _validate(self):
+        reward_tensor_lst = []
+        data_source_lst = []
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+            # test_batch = test_batch.to('cuda')
+
+            # we only do validation on rule-based rm
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
+                return {}
+
+            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+            test_gen_batch.meta_info = {
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'pad_token_id': self.tokenizer.pad_token_id,
+                'recompute_log_prob': False,
+                'do_sample': False,
+                'validate': True,
+            }
+
+            # pad to be divisible by dp_size
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            # unpad
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            print('validation generation end')
+
+            test_batch = test_batch.union(test_output_gen_batch)
+
+            # evaluate using reward_function
+            # for certain reward function (e.g. sandbox), the generation can overlap with reward
+            reward_tensor = self.val_reward_fn(test_batch)
+
+            reward_tensor_lst.append(reward_tensor)
+            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        # evaluate test_score based on data source
+        data_source_reward = {}
+        for i in range(reward_tensor.shape[0]):
+            data_source = data_sources[i]
+            if data_source not in data_source_reward:
+                data_source_reward[data_source] = []
+            data_source_reward[data_source].append(reward_tensor[i].item())
+
+        metric_dict = {}
+        for data_source, rewards in data_source_reward.items():
+            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+
+        return metric_dict
 
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -444,7 +481,7 @@ class RayPPOTrainer(object):
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
-        elif self.config.algorithm.adv_estimator in ['grpo', 'brpo', 'apo']:
+        elif self.config.algorithm.adv_estimator == 'grpo':
             self.use_critic = False
         else:
             raise NotImplementedError
@@ -522,56 +559,77 @@ class RayPPOTrainer(object):
         batch.reorder(global_idx)
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
                                                     partitions=global_partition_lst,
-                                                    prefix=logging_prefix) 
+                                                    prefix=logging_prefix)
         metrics.update(global_balance_stats)
     
+    def _convert_pad_structure(self, tensor, pad_token_id, pad_to_left=True):
+        """originally: [pad_left, content, pad_right]
+        want to: [pad_right, pad_left, content] / [content, pad_right, pad_left]
+        """
+        if pad_to_left:
+            mask = tensor != pad_token_id
+        else:
+            mask = tensor == pad_token_id
+
+        sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
+        converted_tensor = tensor.gather(1, sorted_indices)
+
+        return converted_tensor, sorted_indices
+
+    def _cut_to_effective_len(self, protocol, keys, cut_left=True):
+        assert 'attention_mask' in protocol.batch, 'attention_mask is required'
+        effective_len = protocol.batch['attention_mask'].sum(dim=1).max()
+        for key in keys:
+            if cut_left:
+                protocol.batch[key] = protocol.batch[key][:, -effective_len:]
+            else:
+                protocol.batch[key] = protocol.batch[key][:, :effective_len]
+        return protocol
+
+    def _batch_tokenize(self, responses):
+        return self.tokenizer(responses, add_special_tokens=False, return_tensors='pt', padding="longest")['input_ids']
+
     def fit(self):
         """
         The training loop of PPO.
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        from verl.utils.tracking import Tracking
+        from omegaconf import OmegaConf
 
-        
-        logger = self.logger
+        logger = Tracking(project_name=self.config.trainer.project_name,
+                          experiment_name=self.config.trainer.experiment_name,
+                          default_backend=self.config.trainer.logger,
+                          config=OmegaConf.to_container(self.config, resolve=True))
+
         self.global_steps = 0
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        val_metrics = self._validate()
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+            val_metrics = self._validate()
+            pprint(f'Initial validation metrics: {val_metrics}')
+            logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get('val_only', False):
                 return
 
         # we start from step 1
         self.global_steps += 1
 
+        K = self.config.max_turns
+        max_start_len = self.config.data.max_start_length # the first round prompt max len
+        max_prompt_len = self.config.data.max_prompt_length # the max len of prompt
+        max_response_len = self.config.data.max_response_length # the max length of response
+        max_seq_len = max_prompt_len + max_response_len
+        max_obs_len = self.config.data.max_obs_length
 
+        # dim_room_x, dim_room_y = self.config.env.dim_x, self.config.env.dim_y
+        # num_boxes = self.config.env.num_boxes
+        # max_steps = self.config.env.max_steps
+        # search_depth = self.config.env.search_depth
+        envs = [self.env.copy() for _ in range(self.config.data.train_batch_size)]
 
-        # Agent config preparation
-        gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
-            max_start_length=self.config.data.max_start_length,
-            max_prompt_length=self.config.data.max_prompt_length,
-            max_response_length=self.config.data.max_response_length,
-            max_obs_length=self.config.data.max_obs_length,
-            logging=self.config.logging,
-            num_gpus=self.config.trainer.n_gpus_per_node,
-            no_think_rl=self.config.algorithm.no_think_rl,
-        )
-
-        generation_manager = LLMGenerationManager(
-            tokenizer=self.tokenizer,
-            actor_rollout_wg=self.actor_rollout_wg,
-            env_class=self.env_class,
-            config=gen_config,
-            logger = logger,
-        )
-
-        envs = [self.env.copy() for _ in range(self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n_agent)] 
-
-
-
-        # start training loop
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 print(f'epoch {epoch}, step {self.global_steps}')
@@ -579,7 +637,6 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
 
                 env_seeds = [i['index'] for i in batch.non_tensor_batch['extra_info']]
                 print("env_seeds:", env_seeds)
@@ -608,6 +665,9 @@ class RayPPOTrainer(object):
                 # Below is aLL about agents - the "LLM + forloop"
                 ####################
 
+                # keep the very first input_ids
+                first_input_ids = gen_batch.batch['input_ids'][:, -max_start_len:].clone()
+
                 with _timer('step', timing_raw):
                     """
                     keep rolling to generate K turns of responses.
@@ -617,46 +677,190 @@ class RayPPOTrainer(object):
                     Left-pad prompts, right-gen flow, Tensors dance like stardust glow.
                     Errors swarm? Stay calm, don't fret- Code with coffee, debug sunset.
                     """
-
-                    first_input_ids = gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
-                    output_dir = (f"{self.config.logging.log_image_dir}/"
-                                 f"{self.config.trainer.experiment_name}/"
-                                 f"train/"
-                                 f"step_{self.global_steps}")
-
-                    with _timer('gen', timing_raw):
-                        generation_manager.timing_raw = timing_raw
-                        final_gen_batch_output = generation_manager.run_llm_loop(
-                            gen_batch=gen_batch,
-                            envs=envs,
-                            initial_input_ids=first_input_ids,
-                            output_dir=output_dir,
-                            global_steps=self.global_steps,
-                        )
-
-                    with torch.no_grad():
-                        output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
-                        final_gen_batch_output = final_gen_batch_output.union(output)
+                
+                    rollings = gen_batch
+                                        
+                    original_left_side = {
+                        'input_ids': gen_batch.batch['input_ids'][:, -max_start_len:].clone(), 
+                    }
+                    original_right_side = {
+                        'responses': gen_batch.batch['input_ids'][:, []].clone(),
+                        ## 'old_log_probs': gen_batch.batch['input_ids'][:, []].clone(),
+                    }
+                    meta_info = {}
                     
-                    if self.config.algorithm.adv_estimator == 'grpo': # NOTE we currently use seed to group, better use prompt (hash) to group
-                        batch.non_tensor_batch['uid'] = np.array([str(i) for i in env_seeds], dtype=object)
-                    elif self.config.algorithm.adv_estimator == 'brpo':
-                        batch.non_tensor_batch['uid'] = np.array(["" for _ in range(len(batch.batch))], dtype=object)
-                    elif self.config.algorithm.adv_estimator == 'apo':
-                        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object) # No Relative normalization
+                    # # if exists, remove the existing log
+                    # if os.path.exists(f'.log/{self.config.trainer.experiment_name}'):
+                    #     shutil.rmtree(f'.log/{self.config.trainer.experiment_name}')
 
-                    # reward
+
+                    if self.config.logging.log_images:
+                        n_visualize = self.config.logging.log_n_image_per_batch # TODO set in config
+                        trajectory = [defaultdict(list) for _ in range(n_visualize)] # for visualization
+                    else:
+                        trajectory = None
+
+                    for rollout_step in range(K):
+                        with _timer(f'gen', timing_raw):
+                            # cut to effective length
+                            rollings = self._cut_to_effective_len(rollings, keys=['input_ids', 'attention_mask', 'position_ids'], cut_left=True)
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(rollings)
+                            meta_info.update(gen_batch_output.meta_info)
+
+                        # process gen_batch_output, remove all things like reward: xxx \n to forbid reward hacking
+                        # decode responses, remove all things like reward: xxx \n to forbid reward hacking. 
+                        cur_responses_decoded = self.tokenizer.batch_decode(gen_batch_output.batch['responses'], skip_special_tokens=False)
+
+                        # remove everything after </answer>. But keep the </answer>. If there is no </answer>, do nothing.
+                        cur_responses_decoded = [response.split('</answer>')[0] + '</answer>' if '</answer>' in response else response for response in cur_responses_decoded]
+
+                        # ifthere has been hacks, output this to a log 
+                        hack_pattern = r'reward: \d+\.\d+\n|done: (True|False)\n'
+                        hacked_responses = [response for response in cur_responses_decoded if re.search(hack_pattern, response)]
+                        if len(hacked_responses) > 0:
+                            print(f"[WARNING] HACKED RESPONSES: {hacked_responses}")
+                            cur_responses_decoded = [re.sub(hack_pattern, '', response) for response in cur_responses_decoded]
+                            # see if there is any hack left
+                            if len(hacked_responses) == 0:
+                                print(f"[DEBUG] No hack left in responses.")
+                        
+                        gen_batch_output.batch['responses'] = self._batch_tokenize(cur_responses_decoded)
+                        
+                        below is the code for logging the left and right sides to .log. May be abandoned soon.
+                        os.makedirs(f'.log/{self.config.trainer.experiment_name}/rollout_step_{rollout_step}', exist_ok=True)
+                        import datetime
+                        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        with open(f'.log/{self.config.trainer.experiment_name}/rollout_step_{rollout_step}/left_side.txt', 'w') as f:
+                            f.write(f"{now}\n")
+                            f.write(f"[left side]: \n{rollings}\n")
+                            f.write(f"[left side shape]: \n{rollings.batch['input_ids'].shape}\n")
+                            for idx in range(self.config.logging.log_n_sample_per_batch):
+                                f.write(f"[left side decoded]: \n{self.tokenizer.decode(rollings.batch['input_ids'][idx], skip_special_tokens=False)}\n")
+                            f.write(f"\n")
+
+                        with open(f'.log/{self.config.trainer.experiment_name}/rollout_step_{rollout_step}/right_side.txt', 'w') as f:
+                            f.write(f"{now}\n")
+                            f.write(f"[right side]: \n{gen_batch_output}\n")
+                            f.write(f"[right side shape]: \n{gen_batch_output.batch['responses'].shape}\n")
+                            for idx in range(self.config.logging.log_n_sample_per_batch):
+                                f.write(f"[right side decoded]: \n{self.tokenizer.decode(gen_batch_output.batch['responses'][idx], skip_special_tokens=False)}\n")
+                            f.write(f"\n")
+
+
+
+
+                        # Update here to plot the trajectory and thought
+                        
+                        if trajectory is not None:
+                            for idx, env in enumerate(envs[:n_visualize]):
+                                trajectory[idx]['img_before_action'].append(env.render('rgb_array'))
+                        with _timer('execute_predictions', timing_raw):
+                            cur_responses_decoded = self.tokenizer.batch_decode(gen_batch_output.batch['responses'], skip_special_tokens=False)
+                            next_obs = self.env_class.execute_predictions(envs, cur_responses_decoded, self.tokenizer.pad_token)
+                        if trajectory is not None:
+                            for idx, (cur_response_decoded, env) in enumerate(zip(cur_responses_decoded[:n_visualize], envs[:n_visualize])):
+                                img_after_action = env.render('rgb_array')
+                                parsed_response = parse_llm_output(cur_response_decoded, strategy="raw")
+                                trajectory[idx]['img_after_action'].append(img_after_action)
+                                trajectory[idx]['answer'].append(cur_response_decoded)
+                                trajectory[idx]['parsed_response'].append(parsed_response)
+                        
+
+
+
+
+                        next_obs_input_ids = self.tokenizer(next_obs, padding='longest', return_tensors='pt')['input_ids']
+                        if next_obs_input_ids.shape[1] > max_obs_len:
+                            print("[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG")
+                            print(next_obs_input_ids.shape)
+                            next_obs_input_ids = next_obs_input_ids[:, :max_obs_len]
+
+                        cur_responses = gen_batch_output.batch['responses']          # [BSZ, MAX_RESP_LEN]
+                        ## cur_log_probs = gen_batch_output.batch['old_log_probs']
+
+                        # add responses to the rollings
+                        new_input_ids = torch.cat([
+                            rollings.batch['input_ids'], 
+                            cur_responses,
+                            next_obs_input_ids
+                        ], dim=1)
+
+                        # update rollings, pad to the left
+                        new_input_ids, _ = self._convert_pad_structure(new_input_ids, pad_token_id=self.tokenizer.pad_token_id, pad_to_left=True)
+                        new_attention_mask = torch.where(new_input_ids != self.tokenizer.pad_token_id, 1, 0)
+                        new_position_ids = (torch.cumsum(new_attention_mask, dim=1) - 1) * new_attention_mask
+
+                        effective_len = new_attention_mask.sum(dim=1).max()
+                        max_len = min(max_prompt_len, effective_len)
+
+                        # cut to the min of max_prompt_len and effective_len
+                        new_input_ids = new_input_ids[:, -max_len:]
+                        new_attention_mask = new_attention_mask[:, -max_len:]
+                        new_position_ids = new_position_ids[:, -max_len:]
+
+                        rollings = DataProto.from_dict({
+                            'input_ids': new_input_ids,
+                            'position_ids': new_position_ids,
+                            'attention_mask': new_attention_mask
+                        })
+
+
+                        # update original right side, pad to the right
+                        original_right_side['responses'] = torch.cat([
+                            original_right_side['responses'],
+                            cur_responses,
+                            next_obs_input_ids
+                        ], dim=1)
+                        
+                        original_right_side['responses'], indices = self._convert_pad_structure(original_right_side['responses'], pad_token_id=self.tokenizer.pad_token_id, pad_to_left=False)
+                        ## original_right_side['old_log_probs'] = torch.gather(original_right_side['old_log_probs'], 1, indices)
+                        
+                        # also make a cut
+                        effective_len = torch.where(original_right_side['responses'] != self.tokenizer.pad_token_id, 1, 0).sum(dim=1).max()
+                        max_len = min(max_prompt_len, effective_len)
+                        original_right_side['responses'] = original_right_side['responses'][:, :max_len]
+
+                    # add reward to DataProto batch.non_tensor_batch['reward']
                     batch.non_tensor_batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
                     for idx, env in enumerate(envs):
                         batch.non_tensor_batch['reward'][idx] = env.reward
 
-                    # metric for two-armed bandit
-                    # NOTE here we assume invalid action is 0, low arm is 1, high arm is 2
-                    if batch.non_tensor_batch['data_source'][0] == 'two_armed_bandit':
-                        batch.non_tensor_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                        for idx, env in enumerate(envs):
-                            batch.non_tensor_batch['bandit_metrics'][idx] = env.get_last_action()
+                    # save trajectory as images
+                    if trajectory is not None:
+                        save_trajectory_step_size = self.config.logging.log_image_step_size
+                        if not self.global_steps % save_trajectory_step_size:
+                            output_dir = f"{self.config.logging.log_image_dir}/{self.config.trainer.experiment_name}/step_{self.global_steps}"
+                            os.makedirs(output_dir, exist_ok=True)
+                            save_trajectory_to_output(trajectory, save_dir=output_dir)
 
+                    # compose final gen batch output
+                    with _timer('compose_final_gen_batch_output', timing_raw):
+                        final_gen_batch_output = original_right_side
+                        final_gen_batch_output['prompts'] = original_left_side['input_ids']
+                        final_gen_batch_output['input_ids'] = torch.concat([
+                            original_left_side['input_ids'],
+                            original_right_side['responses']
+                        ], dim=1)
+                        final_gen_batch_output['attention_mask'] = torch.concat([
+                            torch.where(original_left_side['input_ids'] != self.tokenizer.pad_token_id, 1, 0),
+                            torch.where(final_gen_batch_output['responses'] != self.tokenizer.pad_token_id, 1, 0),
+                        ], dim=1)
+                        final_gen_batch_output['position_ids'] = (torch.cumsum(final_gen_batch_output['attention_mask'], dim=1) - 1) * final_gen_batch_output['attention_mask']
+
+                        final_gen_batch_output = DataProto.from_dict(original_right_side)
+                        final_gen_batch_output.meta_info.update(meta_info)
+
+                    # to get the old_log_probs
+                    with _timer('ref_probs_forward', timing_raw):
+                        with torch.no_grad():
+                            output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)  # [IMPLEMENT]
+                            final_gen_batch_output = final_gen_batch_output.union(output)
+                            # print output length
+                            print(f"everything about output like length: {output}")
+                        # response_len = original_right_side['responses'].shape[1]
+                    #     final_gen_batch_output['old_log_probs'] = output[:, -response_len:]
+
+                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(final_gen_batch_output)
 
@@ -733,6 +937,7 @@ class RayPPOTrainer(object):
                         self.global_steps % self.config.trainer.test_freq == 0:
                         with _timer('testing', timing_raw):
                             val_metrics: dict = self._validate()
+                        metrics.update(val_metrics)
 
                     if self.config.trainer.save_freq > 0 and \
                             self.global_steps % self.config.trainer.save_freq == 0:
@@ -753,116 +958,6 @@ class RayPPOTrainer(object):
                     # perform validation after training
                     if self.val_reward_fn is not None:
                         val_metrics = self._validate()
+                        pprint(f'Final validation metrics: {val_metrics}')
+                        logger.log(data=val_metrics, step=self.global_steps)
                     return
-
-    def _validate(self):
-        """
-        The training loop of PPO with global metric computation.
-        Accumulates metrics across all batches before computing final statistics.
-        """
-        import torch
-        # Initialize global metric storage
-        global_token_scores = []
-        global_metrics = {}
-
-        self.val_num += 1
-
-        gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
-            max_start_length=self.config.data.max_start_length,
-            max_prompt_length=self.config.data.max_prompt_length,
-            max_response_length=self.config.data.max_response_length,
-            max_obs_length=self.config.data.max_obs_length,
-            logging=self.config.logging,
-            num_gpus=self.config.trainer.n_gpus_per_node,
-            no_think_rl=self.config.algorithm.no_think_rl,
-        )
-
-        # Agent config preparation
-        generation_manager = LLMGenerationManager(
-            tokenizer=self.tokenizer,
-            actor_rollout_wg=self.actor_rollout_wg,
-            env_class=self.env_class,
-            config=gen_config,
-            logger = self.logger,
-        )
-
-        envs = [self.env.copy() for _ in range(self.config.data.val_batch_size * self.config.actor_rollout_ref.rollout.n_agent)]
-        val_global_steps = 1
-
-        for batch_dict in self.val_dataloader:
-            timing_raw = {}
-            test_batch: DataProto = DataProto.from_single_dict(batch_dict)
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
-
-            env_seeds = [i['index'] for i in test_batch.non_tensor_batch['extra_info']]
-            print("env_seeds:", env_seeds)
-            for env, seed in zip(envs, env_seeds):
-                env.reset(seed=seed)
-            
-            test_gen_batch = test_batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
-            test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': False,
-                'validate': True,
-            }
-            with _timer('step', timing_raw):
-                first_input_ids = test_gen_batch.batch['input_ids'][:, -gen_config.max_start_length:].clone()
-                output_dir = (f"{self.config.logging.log_image_dir}/"
-                                f"{self.config.trainer.experiment_name}/"
-                                f"validation_{self.val_num}/"
-                                f"step_{val_global_steps}")
-                with _timer('gen', timing_raw):
-                    generation_manager.timing_raw = timing_raw
-                    final_gen_batch_output = generation_manager.run_llm_loop(
-                        gen_batch=test_gen_batch,
-                        envs=envs,
-                        initial_input_ids=first_input_ids,
-                        output_dir=output_dir,
-                        global_steps=val_global_steps,
-                    )
-                with torch.no_grad():
-                    output = self.actor_rollout_wg.compute_log_prob(final_gen_batch_output)
-                    final_gen_batch_output = final_gen_batch_output.union(output)
-
-                test_batch.non_tensor_batch['reward'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                for idx, env in enumerate(envs):
-                    test_batch.non_tensor_batch['reward'][idx] = env.reward
-
-                # metric for two-armed bandit
-                # NOTE here we assume invalid action is 0, low arm is 1, high arm is 2
-                if test_batch.non_tensor_batch['data_source'][0] == 'two_armed_bandit':
-                    test_batch.non_tensor_batch['bandit_metrics'] = np.array([0 for _ in range(len(envs))], dtype=object)
-                    for idx, env in enumerate(envs):
-                        test_batch.non_tensor_batch['bandit_metrics'][idx] = env.get_last_action()
-                    if 'actions' not in global_metrics:
-                        global_metrics['actions'] = []
-                    global_metrics['actions'].extend(test_batch.non_tensor_batch['bandit_metrics'])
-
-                # Accumulate batch metrics into global storage
-                global_token_scores.append(test_batch.non_tensor_batch['reward'])
-
-
-        global_scores = np.concatenate(global_token_scores, axis=0)
-        global_metrics.update({
-            'global_score/mean': float(global_scores.mean()),
-            'global_score/max': float(global_scores.max()),
-            'global_score/min': float(global_scores.min()),
-            'global_score/std': float(global_scores.std()),
-        })
-        if 'actions' in global_metrics: # NOTE hard code for two-armed bandit
-            batch_action = torch.from_numpy(np.array(global_metrics['actions'], dtype=np.int16))
-            n_low_arm = torch.sum(batch_action == 1).detach().item()
-            n_high_arm = torch.sum(batch_action == 2).detach().item()
-            n_invalid = torch.sum(batch_action == 0).detach().item()
-            global_metrics['validate_metric/n_low_arm'] = n_low_arm
-            global_metrics['validate_metric/n_high_arm'] = n_high_arm
-            global_metrics['validate_metric/n_invalid'] = n_invalid
-            global_metrics.pop('actions')
-        print("global_metrics", global_metrics)
-        self.logger.log(data=global_metrics, step=self.val_num)
-        return global_metrics
-    
-    

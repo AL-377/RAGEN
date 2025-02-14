@@ -1,11 +1,3 @@
-
-# python ragen/emulator/main.py \
-#     --env CartPole-v1 \
-#     --train_size 1000 \
-#     --test_size 100 \
-#     --num_envs 8 \
-#     --template qwen-instruct \
-#     --output data/cartpole_large
 #!/bin/bash
 
 # Exit on error
@@ -30,30 +22,34 @@ print_warning() {
     echo -e "${YELLOW}[Warning] ${1}${NC}"
 }
 
-# Create Sokoban dataset
+# Create Sokoban dataset with specified parameters
 create_sokoban_dataset() {
-    print_step "Configuring Sokoban environment settings..."
-        
-    # Sokoban environment settings
-    export DIM_X=6
-    export DIM_Y=6
-    export NUM_BOXES=1
-
-    # generate normal difficulty dataset
-    export MAX_STEPS=10
-    export SEARCH_DEPTH=30
+    local name=$1
+    local dim_x=$2
+    local dim_y=$3
+    local num_boxes=$4
+    local search_depth=$5
     
-    print_step "Creating Sokoban dataset..."
+    print_step "Configuring ${name} environment settings..."
+    
+    # Sokoban environment settings
+    export DIM_X=$dim_x
+    export DIM_Y=$dim_y
+    export NUM_BOXES=$num_boxes
+    export MAX_STEPS=10
+    export SEARCH_DEPTH=$search_depth
+    
+    print_step "Creating Sokoban ${name} dataset..."
     print_warning "Note: SOKOBAN errors during creation are normal and can be ignored"
     
     python ragen/env/sokoban/create_dataset.py \
-        --output data/sokoban \
+        --output "data/${name}" \
         --seed 10000 \
         --train_size 10000 \
-        --test_size 500 \
+        --test_size 10 \
         --prefix qwen-instruct
         
-    echo -e "${GREEN}Sokoban dataset created successfully!${NC}"
+    echo -e "${GREEN}Sokoban ${name} dataset created successfully!${NC}"
 }
 
 # Create FrozenLake dataset
@@ -70,7 +66,7 @@ create_frozen_lake_dataset() {
         --output data/frozenlake \
         --seed 100000 \
         --train_size 10000 \
-        --test_size 500 \
+        --test_size 10 \
         --prefix qwen-instruct
         
     echo -e "${GREEN}FrozenLake dataset created successfully!${NC}"
@@ -90,21 +86,39 @@ create_two_armed_bandit_dataset() {
         --output data/two_armed_bandit \
         --seed 100000 \
         --train_size 10000 \
-        --test_size 500 \
+        --test_size 10 \
         --prefix qwen-instruct
         
     echo -e "${GREEN}Two-Armed Bandit dataset created successfully!${NC}"
 }
 
-
 # Main function
 main() {
-    # Create data directory if it doesn't exist
-    mkdir -p data/sokoban data/frozenlake data/two_armed_bandit
+    # Create all data directories
+    mkdir -p data/sokoban data/sokoban_hard data/sokoban_xhard \
+            data/sokoban_large data/sokoban_xlarge \
+            data/sokoban_multi data/sokoban_xmulti \
+            data/frozenlake \
+            data/two_armed_bandit
     
-    # Create datasets
-    create_sokoban_dataset
+    # Create normal Sokoban dataset (baseline)
+    create_sokoban_dataset "sokoban" 6 6 1 30
+    
+    # Create hard difficulty datasets
+    create_sokoban_dataset "sokoban_hard" 6 6 1 100
+    create_sokoban_dataset "sokoban_xhard" 6 6 1 500
+    
+    # Create larger grid datasets
+    create_sokoban_dataset "sokoban_large" 8 8 1 30
+    create_sokoban_dataset "sokoban_xlarge" 10 10 1 30
+    
+    # Create multi-box datasets
+    create_sokoban_dataset "sokoban_multi" 6 6 2 30
+    
+    # Create FrozenLake dataset
     create_frozen_lake_dataset
+    
+    # Create Two-Armed Bandit dataset
     create_two_armed_bandit_dataset
     
     echo -e "${GREEN}All datasets created successfully!${NC}"

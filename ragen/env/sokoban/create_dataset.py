@@ -13,14 +13,40 @@ from verl.utils.hdfs_io import copy, makedirs
 import argparse
 import datasets
 
-from ragen.policy.bfs import BFSPolicy
-from ragen.policy.heuristic import FixedPolicy
 from ragen.env.sokoban import SokobanEnv
-from ragen.evaluators.trajectory_evaluator import TrajectoryEvaluator
-# from ragen.utils.dataset import Dataset
+
+
+INSTRUCTION_TEMPLATE = """You are a Sokoban solver.
+
+Sokoban Quick Guide
+Goal: Push all boxes (X) onto targets (O).
+
+Symbols:
+# Wall | _ Floor | O Target | X Box | P You | √ = Box on Target | S = You on Target
+
+Rules:
+1. Push boxes (can't pull).
+2. Avoid walls (#).
+
+Answers:
+<answer> 1 (Up) </answer> | <answer> 2 (Down) </answer> | <answer> 3 (Left) </answer> | <answer> 4 (Right) </answer>
+
+Rewards:
+Move: -0.1
+Box on target: +1.0
+All boxes placed: +10.0
+
+
+[Cumulative Observations]:
+{observation}
+Decide the next action:\
+"""
+
+
+
 
 templates = {
-    'qwen-instruct': '<|im_start|>system\nYou are a helpful assistant. <|im_end|>\n<|im_start|>user\n{prompt}\nAlways output: <think> [Your thoughts] </think> <answer> [your answer] </answer> with no extra test. Strictly follow this format. <|im_end|>\n<|im_start|>assistant\n<think>',
+    'qwen-instruct': '<|im_start|>user\n{prompt}\nAlways output: <think> [Your thoughts] </think> <answer> [your answer] </answer> with no extra text. Strictly follow this format. <|im_end|>\n<|im_start|>assistant\n<think>',
     'base': 'A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks briefly about the reasoning process in the mind and then provides the user with the answer.\nUser: {prompt}\nShow your work in <think> </think> tags. And return the final answer in <answer> </answer> tags, for example <think> [Thoughts] </think> <answer> 1 </answer>\nAssistant: \n<think>'
 }
 
@@ -45,30 +71,22 @@ def main():
     dim_x, dim_y, num_boxes, max_steps, search_depth = os.environ.get("DIM_X"), os.environ.get("DIM_Y"), os.environ.get("NUM_BOXES"), os.environ.get("MAX_STEPS"), os.environ.get("SEARCH_DEPTH")
     dim_x, dim_y, num_boxes, max_steps, search_depth = int(dim_x), int(dim_y), int(num_boxes), int(max_steps), int(search_depth)
 
-    env = SokobanEnv(dim_room=(dim_x, dim_y), num_boxes=num_boxes, max_steps=max_steps, search_depth=search_depth)
-    policy = FixedPolicy()
-    # policy = BFSPolicy(max_nodes=args.bfs_max_nodes)
-    evaluator = TrajectoryEvaluator(env, policy, max_steps=1)
-
-    # Generate trajectories
     seeds = range(args.seed, args.seed + args.train_size + args.test_size)
-    trajectories = evaluator.batch_evaluate(seeds, mp=True) # mp=False is not working
-
-    # # Print metrics for BFS
-    # evaluator.print_metrics()
-
-    # TRAIN_SIZE = args.train_size
-    # TEST_SIZE = args.test_size
-
-    # dataset_views = Dataset(trajectories).transform("decision_making")
-
-    # assert len(raw_dataset) > TRAIN_SIZE + TEST_SIZE
-    # train_dataset = raw_dataset.select(range(TRAIN_SIZE))
-    # test_dataset = raw_dataset.select(range(TRAIN_SIZE, TRAIN_SIZE + TEST_SIZE))
-
-    # dataset just need to provide placeholders
-    def _create_instance(idx, traj):
-        prompt_formatted = templates[args.prefix].format(prompt=traj[0]['policy_input'])
+    instructions = []
+    for seed in seeds:
+        env = SokobanEnv(
+            dim_room=(dim_x, dim_y),
+            num_boxes=num_boxes,
+            max_steps=max_steps,
+            search_depth=search_depth
+        )
+        observation = env.reset(seed=seed, mode='tiny_rgb_array')
+        instruction = INSTRUCTION_TEMPLATE.format(observation=observation)
+        instructions.append(instruction)
+    
+    
+    def _create_instance(idx, instruction):
+        prompt_formatted = templates[args.prefix].format(prompt=instruction)
 
         return {
             "data_source": data_source,
@@ -77,8 +95,8 @@ def main():
             "reward_model": {"style": "rule", "ground_truth": {"target": 0, "numbers": [0, 0]}},
             "extra_info": {"split": "train", "index": idx}
         }
-    train_dataset = Dataset.from_list([_create_instance(args.seed + i, trajectories[i]) for i in range(args.train_size)])
-    test_dataset = Dataset.from_list([_create_instance(args.seed + i, trajectories[i]) for i in range(args.train_size, args.train_size + args.test_size)])
+    train_dataset = Dataset.from_list([_create_instance(args.seed + i, instructions[i]) for i in range(args.train_size)])
+    test_dataset = Dataset.from_list([_create_instance(args.seed + i, instructions[i]) for i in range(args.train_size, args.train_size + args.test_size)])
 
 
     def make_map_fn(split):
